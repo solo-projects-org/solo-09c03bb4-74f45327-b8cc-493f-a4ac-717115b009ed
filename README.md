@@ -16,7 +16,7 @@ open http://localhost:8000/docs          # Swagger UI
 curl -sS -X POST http://localhost:8000/api/v1/versions \
      -F "file=@samples/gtfs_v1.zip" | jq
 
-# 发布第二版（上一版仍然保留）
+# 发布第二版（上一版仍然保留，且新版自动成为当前版本）
 curl -sS -X POST http://localhost:8000/api/v1/versions \
      -F "file=@samples/gtfs_v2.zip" | jq
 
@@ -24,6 +24,12 @@ curl -sS -X POST http://localhost:8000/api/v1/versions \
 curl -sS "http://localhost:8000/api/v1/trips/T1/stops" | jq
 # 按版号查询（旧版）
 curl -sS "http://localhost:8000/api/v1/trips/T1/stops?version=1" | jq
+
+# 发现新版有误：先查看当前版号，再把旧版启用为当前版本
+curl -sS http://localhost:8000/api/v1/versions | jq .current_version   # 例如 2
+curl -sS -X POST http://localhost:8000/api/v1/versions/1/activate \
+     -H "Content-Type: application/json" \
+     -d '{"expected_current_version": 2}' | jq
 
 # 下载原 ZIP
 curl -sS -OJ "http://localhost:8000/api/v1/versions/1/download"
@@ -33,15 +39,29 @@ curl -sS -OJ "http://localhost:8000/api/v1/versions/1/download"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/versions` | 上传 ZIP 并发布新版本 |
+| `POST` | `/api/v1/versions` | 上传 ZIP 并发布新版本（自动启用为当前版本） |
 | `GET` | `/api/v1/versions` | 列出版本（新版本在前），含当前版本号 |
 | `GET` | `/api/v1/versions/{version}` | 版本元信息（`version` 可为版号或 `current`） |
+| `POST` | `/api/v1/versions/{version}/activate` | 启用指定版号为当前版本（需提交操作前看到的当前版号） |
 | `GET` | `/api/v1/versions/{version}/trips/{trip_id}/stops` | 指定版本某班次的完整停站 |
 | `GET` | `/api/v1/trips/{trip_id}/stops?version=…` | 班次停站，`version` 省略时为当前版本 |
 | `GET` | `/api/v1/versions/{version}/download` | 下载该版本原始 ZIP |
 | `GET` | `/healthz` | 健康检查 |
 
 Swagger：`/docs`，OpenAPI：`/openapi.json`。
+
+## 启用（回滚）旧版本
+
+`POST /api/v1/versions/{version}/activate` 把某个已发布版本启用为当前版本，请求体必须带上操作前看到的当前版号：
+
+```json
+{"expected_current_version": 2}
+```
+
+- 启用前会完整核对目标版本原 ZIP 与登记的 SHA-256 摘要：文件缺失返回 `410`，摘要不符返回 `409`，两种情况下当前版本都保持原状。
+- 若并发期间当前版号已被其他启用/发布操作改变（提交的 `expected_current_version` 过期），返回 `409` 且响应中带实际的 `current_version`，重新读取后可重试；成功的操作按提交顺序决定当前版本。
+- 目标必须是显式版号（不能是 `current`）；启用不存在的版本返回 `404`。
+- 启用状态持久化在 SQLite 中，失败或重启不会丢失最后已提交的启用结果。
 
 ## 发布校验
 
@@ -72,8 +92,9 @@ Swagger：`/docs`，OpenAPI：`/openapi.json`。
 ## 一致性保证
 
 - 上传字节先写入 `staging/` 唯一临时文件并完成校验，再在 SQLite 写事务（`BEGIN IMMEDIATE`）内原子改名为不可变的 `artifacts/<uuid>.zip`，最后在同一事务里登记版本及所有行并提交。并发上传因此串行化。
-- 读者在单个读事务中解析版本号并读取数据，因此每次查询只会看到某一个已提交版本，不会看到半个版本或跨版本混合。
-- 登记失败会回滚事务并删除刚落地的文件；启动时还会清理残留的临时文件与未被引用的包（保留已提交版本的文件），重启不丢版本。
+- "当前版本"是显式的已提交状态（`meta` 表中的 `current_version_id`），不是查询时推导的最大版号：发布在同一事务里把指针移到新版（新发布仍自动启用）；启用旧版先核对目标原 ZIP 的登记摘要，再在同一写事务内对指针做比较并交换（CAS）。多实例并发启用/发布由 SQLite 写锁串行化，过期的期望当前版号被拒绝，成功操作按提交顺序生效。
+- 读者在单个读事务中解析当前版指针并读取数据，因此每次查询只会看到某一个已提交版本，不会看到半个版本或跨版本混合。
+- 登记失败会回滚事务并删除刚落地的文件；启动时还会清理残留的临时文件与未被引用的包（保留已提交版本的文件），重启不丢版本，也不丢最后已提交的启用状态。
 - 下载前校验文件存在且 SHA-256 与登记的摘要一致，并用同一文件句柄流传已校验的字节；缺失返回 `410`，摘要不符返回 `409`。
 - 新版本发布只追加，旧版号仍可查询与下载。发布响应中的 `previous_version` 在同一写事务内读取，并发上传时也准确。
 

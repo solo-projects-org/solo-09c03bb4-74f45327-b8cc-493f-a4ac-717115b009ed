@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from .gtfs_parse import FeedRejected, validate_archive
 from .store import (
+    InvalidActivationTarget,
     StorageError,
     Store,
     VersionInfo,
@@ -59,9 +60,13 @@ app = FastAPI(
         "发布时校验：站点/班次 ID 唯一、停站必须引用存在的站点和班次、"
         "每站必须有到站时刻、同班次站序不得重复、时刻随站序不得倒退；"
         "超过 24 点的 GTFS 时刻（如 25:10:00）是合法的。"
-        "校验失败会返回文件与行号，且不会改变任何已发布版本。"
+        "校验失败会返回文件与行号，且不会改变任何已发布版本。\n\n"
+        "新版本发布即自动启用为当前版本；如发现新版时刻表有误，可调用"
+        " `POST /api/v1/versions/{version}/activate` 按版号启用一份已发布的旧版"
+        "（需提交操作前看到的当前版号；启用前会核对目标原 ZIP 的登记摘要，"
+        "文件缺失或不符则保持原状）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -92,6 +97,22 @@ class PublicationResult(BaseModel):
     previous_version: Optional[int] = Field(
         description="发布前查询的当前版本号（旧版仍可按版号访问）"
     )
+
+
+class ActivationRequest(BaseModel):
+    expected_current_version: Optional[int] = Field(
+        description=(
+            "操作前看到的当前版本号（即 GET /api/v1/versions 返回的 "
+            "current_version）；与服务器实际当前版号不一致时拒绝启用"
+        ),
+        examples=[2],
+    )
+
+
+class ActivationResult(BaseModel):
+    current_version: int = Field(description="启用后的当前版本号")
+    previous_version: Optional[int] = Field(description="启用前的当前版本号")
+    version: VersionSummary = Field(description="被启用的版本")
 
 
 class StopArrival(BaseModel):
@@ -168,9 +189,11 @@ async def _storage_error_handler(request: Request, exc: StorageError) -> JSONRes
     headers = {}
     if exc.status_code == 410:
         headers["Cache-Control"] = "no-store"
+    content = {"error": exc.code, "message": exc.message}
+    content.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": exc.code, "message": exc.message},
+        content=content,
         headers=headers,
     )
 
@@ -344,6 +367,48 @@ def _validate_and_publish(
         size_bytes=size,
         upload_filename=upload_name,
         feed=feed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activation (roll dispatching back to a previously published version)
+# ---------------------------------------------------------------------------
+
+
+def _parse_explicit_version(raw: str) -> int:
+    """Activation targets must be explicit version numbers, never aliases."""
+    value = (raw or "").strip()
+    if not value.isdigit() or int(value) <= 0:
+        raise InvalidActivationTarget(raw)
+    return int(value)
+
+
+@app.post(
+    "/api/v1/versions/{version}/activate",
+    response_model=ActivationResult,
+    summary="启用指定版本为当前版本（调度查询切回该版）",
+    responses={
+        400: {"model": ErrorResponse, "description": "启用目标必须是显式正整数版号"},
+        404: {"model": ErrorResponse, "description": "目标版本不存在"},
+        409: {
+            "model": ErrorResponse,
+            "description": "提交的当前版号已过期，或目标原 ZIP 与登记摘要不符",
+        },
+        410: {"model": ErrorResponse, "description": "目标版本原 ZIP 缺失"},
+    },
+)
+def activate_version(version: str, body: ActivationRequest) -> ActivationResult:
+    store = get_store()
+    version_id = _parse_explicit_version(version)
+    # The store verifies the target artifact's registered digest first (a
+    # missing or mismatched ZIP leaves everything unchanged), then moves the
+    # current pointer with a compare-and-swap on expected_current_version
+    # inside one write transaction.
+    info, previous = store.activate(version_id, body.expected_current_version)
+    return ActivationResult(
+        current_version=info.version_id,
+        previous_version=previous,
+        version=_summary(info),
     )
 
 

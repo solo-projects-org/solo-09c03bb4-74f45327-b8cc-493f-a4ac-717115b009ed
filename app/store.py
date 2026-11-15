@@ -20,6 +20,19 @@ deleted again (and any orphan is swept at startup).  The old version was never
 touched, so it stays fully queryable.  Every read request runs inside one
 SQLite read transaction, giving it a stable snapshot even while a publication
 is committing.
+
+Which version is "current" is explicit committed state (the
+``current_version_id`` row in ``meta``), not a derived MAX():
+
+* A publish moves the pointer to the new version inside the same transaction
+  that registers it, so a new release is still activated automatically.
+* An activation (rollback to an older version) first verifies the target's
+  registered artifact digest — a missing or tampered ZIP leaves the pointer
+  untouched — then performs a compare-and-swap on the pointer inside a
+  ``BEGIN IMMEDIATE`` transaction.  Concurrent activations/publishes across
+  threads and processes are therefore serialised, a stale expected-current
+  value is rejected, and successful operations decide the current version in
+  commit order.
 """
 
 from __future__ import annotations
@@ -49,10 +62,19 @@ RECOVERY_GRACE_SECONDS = 300
 class StorageError(Exception):
     """Base class for storage-layer failures mapped to HTTP responses."""
 
-    def __init__(self, code: str, message: str, status_code: int):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int,
+        extra: Optional[Dict[str, object]] = None,
+    ):
         self.code = code
         self.message = message
         self.status_code = status_code
+        # Extra fields merged into the error JSON (e.g. the actual current
+        # version when an activation is rejected as stale).
+        self.extra: Dict[str, object] = dict(extra or {})
         super().__init__(message)
 
 
@@ -78,6 +100,31 @@ class NoPublishedVersion(StorageError):
         super().__init__(
             "no_published_version", "no GTFS version has been published yet", 404
         )
+
+
+class InvalidActivationTarget(StorageError):
+    def __init__(self, version: str):
+        super().__init__(
+            "invalid_version",
+            f"activation target must be an explicit positive version number "
+            f"(got {version!r})",
+            400,
+        )
+
+
+class CurrentVersionConflict(StorageError):
+    """The submitted expected current version no longer matches."""
+
+    def __init__(self, expected: Optional[int], actual: Optional[int]):
+        super().__init__(
+            "current_version_conflict",
+            f"current version is {actual}, not the expected {expected}; "
+            "reload the version list and retry",
+            409,
+            extra={"expected_current_version": expected, "current_version": actual},
+        )
+        self.expected = expected
+        self.actual = actual
 
 
 class TripNotFound(StorageError):
@@ -158,7 +205,18 @@ CREATE TABLE IF NOT EXISTS stop_times (
     FOREIGN KEY (version_id, stop_id) REFERENCES stops(version_id, stop_id),
     FOREIGN KEY (version_id, trip_id) REFERENCES trips(version_id, trip_id)
 );
+
+-- Durable single-row service state.  The 'current_version_id' key holds the
+-- committed pointer that every 'current' query resolves through; it is moved
+-- only inside a BEGIN IMMEDIATE transaction (by a publish or an activation),
+-- so a committed value is never lost to a crash or a restart.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+CURRENT_VERSION_KEY = "current_version_id"
 
 
 def utc_now() -> str:
@@ -171,9 +229,9 @@ class Store:
         self.artifacts_dir = self.data_dir / "artifacts"
         self.staging_dir = self.data_dir / "staging"
         self.db_path = self.data_dir / "gtfs.db"
-        # Serialises publications inside this process; SQLite's own
-        # BEGIN IMMEDIATE serialises them across processes as well.
-        self._publish_lock = threading.Lock()
+        # Serialises writes (publishes and activations) inside this process;
+        # SQLite's own BEGIN IMMEDIATE serialises them across processes too.
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
     def init(self) -> None:
@@ -184,9 +242,34 @@ class Store:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            self._migrate_current_pointer(conn)
         finally:
             conn.close()
         self._recover()
+
+    @staticmethod
+    def _migrate_current_pointer(conn: sqlite3.Connection) -> None:
+        """Seed ``current_version_id`` for databases created before the meta
+        table existed: the current version was implicitly the highest one."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (CURRENT_VERSION_KEY,)
+            ).fetchone()
+            if row is None:
+                highest = conn.execute(
+                    "SELECT MAX(version_id) AS current FROM versions"
+                ).fetchone()["current"]
+                if highest is not None:
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES (?, ?)",
+                        (CURRENT_VERSION_KEY, str(int(highest))),
+                    )
+            conn.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
 
     def _recover(self) -> None:
         """Remove interrupted uploads and unreferenced artifacts.
@@ -269,21 +352,14 @@ class Store:
         artifact_path = self.artifacts_dir / artifact_name
         created_at = utc_now()
         moved = False
-        with self._publish_lock:
+        with self._write_lock:
             conn = self._connect()
             try:
                 # Take the write lock first: while it is held, no recovery sweep
                 # in another process can mistake the freshly renamed artifact
                 # for an orphan, and concurrent publishers are serialised.
                 conn.execute("BEGIN IMMEDIATE")
-                current_row = conn.execute(
-                    "SELECT MAX(version_id) AS current FROM versions"
-                ).fetchone()
-                previous = (
-                    int(current_row["current"])
-                    if current_row is not None and current_row["current"] is not None
-                    else None
-                )
+                previous = self._current_version_id(conn)
                 # Durable bytes before registration.
                 os.replace(staging_path, artifact_path)
                 moved = True
@@ -305,6 +381,10 @@ class Store:
                 )
                 version_id = int(cursor.lastrowid)
                 self._insert_rows(conn, version_id, feed)
+                # A new release becomes current in the same commit, so readers
+                # never observe a registered version that is not yet current
+                # (or a current pointer without its version).
+                self._set_current_version_id(conn, version_id)
                 conn.execute("COMMIT")
             except BaseException:
                 with contextlib.suppress(sqlite3.Error):
@@ -379,16 +459,75 @@ class Store:
             finally:
                 os.close(fd)
 
+    # ------------------------------------------------------------ activation
+    def activate(
+        self, version_id: int, expected_current: Optional[int]
+    ) -> Tuple[VersionInfo, Optional[int]]:
+        """Make ``version_id`` the current version (compare-and-swap).
+
+        The target's registered artifact is fully verified first; a missing
+        or tampered ZIP raises and leaves the current pointer untouched.  The
+        expected-current check and the pointer update then happen inside one
+        ``BEGIN IMMEDIATE`` transaction, so concurrent activations and
+        publishes — in this process or others sharing the database — are
+        serialised, a stale expectation is rejected, and the committed
+        operations decide the current version in commit order.
+
+        Returns ``(activated_version, previous_current_version_id)``.
+        """
+        with self.read_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM versions WHERE version_id = ?", (version_id,)
+            ).fetchone()
+            if row is None:
+                raise VersionNotFound(str(version_id))
+            info = self._version_info(row)
+
+        # Refuse to switch dispatching to a version whose original package is
+        # gone or no longer matches the registered digest.  Nothing has been
+        # written at this point, so the current version is unchanged.
+        self.verify_artifact(info)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._current_version_id(conn)
+                if current != expected_current:
+                    raise CurrentVersionConflict(expected_current, current)
+                self._set_current_version_id(conn, version_id)
+                conn.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return info, current
+
+    # ------------------------------------------------------ current pointer
+    @staticmethod
+    def _current_version_id(conn: sqlite3.Connection) -> Optional[int]:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (CURRENT_VERSION_KEY,)
+        ).fetchone()
+        return int(row["value"]) if row is not None else None
+
+    @staticmethod
+    def _set_current_version_id(conn: sqlite3.Connection, version_id: int) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (CURRENT_VERSION_KEY, str(version_id)),
+        )
+
     # ------------------------------------------------------------ resolution
     def _resolve_version(self, conn: sqlite3.Connection, version: str) -> int:
         value = (version or "").strip()
         if value.lower() in CURRENT_ALIASES:
-            row = conn.execute(
-                "SELECT MAX(version_id) AS current FROM versions"
-            ).fetchone()
-            if row is None or row["current"] is None:
+            current = self._current_version_id(conn)
+            if current is None:
                 raise NoPublishedVersion()
-            return int(row["current"])
+            return current
         if not value.isdigit() or int(value) <= 0:
             raise InvalidVersion(version)
         version_id = int(value)
@@ -418,7 +557,7 @@ class Store:
             artifact_name=row["artifact_name"],
         )
 
-    def get_version(self, version: str) -> Tuple[VersionInfo, int]:
+    def get_version(self, version: str) -> Tuple[VersionInfo, Optional[int]]:
         """Return ``(metadata, current_version_id)`` from one snapshot."""
         with self.read_transaction() as conn:
             version_id = self._resolve_version(conn, version)
@@ -427,22 +566,16 @@ class Store:
             ).fetchone()
             if row is None:  # pragma: no cover - resolved above
                 raise VersionNotFound(version)
-            current = conn.execute(
-                "SELECT MAX(version_id) AS current FROM versions"
-            ).fetchone()["current"]
-        return self._version_info(row), int(current)
+            current = self._current_version_id(conn)
+        return self._version_info(row), current
 
     def list_versions(self) -> Tuple[List[VersionInfo], Optional[int]]:
         with self.read_transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM versions ORDER BY version_id DESC"
             ).fetchall()
-            current = conn.execute(
-                "SELECT MAX(version_id) AS current FROM versions"
-            ).fetchone()["current"]
-        return [self._version_info(row) for row in rows], (
-            int(current) if current is not None else None
-        )
+            current = self._current_version_id(conn)
+        return [self._version_info(row) for row in rows], current
 
     def trip_stops(
         self, version: str, trip_id: str
@@ -490,6 +623,16 @@ class Store:
         if not name or Path(name).name != name or "/" in name or "\\" in name:
             raise ArtifactCorrupt(info.version_id, "invalid artifact name in registry")
         return self.artifacts_dir / name
+
+    def verify_artifact(self, info: VersionInfo) -> None:
+        """Fully verify the registered artifact against its digest.
+
+        Raises :class:`ArtifactMissing` or :class:`ArtifactCorrupt`; used by
+        the activation path so a version with a broken package is never made
+        current.
+        """
+        fd = self.open_verified_artifact(info)
+        os.close(fd)
 
     def open_verified_artifact(self, info: VersionInfo) -> int:
         """Open and fully verify the ZIP; return a read handle positioned at 0.

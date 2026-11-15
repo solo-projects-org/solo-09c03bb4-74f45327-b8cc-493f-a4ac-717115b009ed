@@ -25,10 +25,15 @@ from app.store import Store
 
 
 def make_zip(files: dict[str, str]) -> bytes:
+    """Deterministic ZIP: fixed member timestamps, so repeated calls with the
+    same files produce identical bytes (several tests re-generate the upload
+    and compare it against the downloaded artifact)."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, text in files.items():
-            zf.writestr(name, text)
+            info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, text)
     return buffer.getvalue()
 
 
@@ -637,3 +642,254 @@ def test_openapi_and_docs_available(client: TestClient):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
     assert client.get("/healthz").json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Activation (rolling dispatching back to a previously published version)
+# ---------------------------------------------------------------------------
+
+
+def activate(client: TestClient, version, expected_current):
+    return client.post(
+        f"/api/v1/versions/{version}/activate",
+        json={"expected_current_version": expected_current},
+    )
+
+
+def test_activate_previous_version_rolls_dispatch_back(client: TestClient):
+    assert upload(client).status_code == 201
+    v2_files = dict(BASE_FILES)
+    v2_files["stop_times.txt"] = (
+        "trip_id,arrival_time,stop_id,stop_sequence\n"
+        "T1,06:00:00,S1,1\n"
+        "T1,06:20:00,S3,2\n"          # v2: express skips S2
+        "T2,07:00:00,S1,1\n"
+        "T2,07:15:00,S3,2\n"
+    )
+    assert upload(client, zip_bytes(v2_files)).status_code == 201
+    assert client.get("/api/v1/versions").json()["current_version"] == 2
+
+    response = activate(client, 1, expected_current=2)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["current_version"] == 1
+    assert body["previous_version"] == 2
+    assert body["version"]["version_id"] == 1
+
+    # Dispatch queries now see v1 again; the listing agrees.
+    current = client.get("/api/v1/trips/T1/stops").json()
+    assert current["version_id"] == 1
+    assert [s["stop_id"] for s in current["stops"]] == ["S1", "S2", "S3"]
+    assert client.get("/api/v1/versions").json()["current_version"] == 1
+    assert client.get("/api/v1/versions/current").json()["version_id"] == 1
+
+    # The rolled-back-from version is still queryable and downloadable.
+    assert client.get("/api/v1/trips/T1/stops?version=2").json()["version_id"] == 2
+    assert client.get("/api/v1/versions/2/download").status_code == 200
+
+
+def test_activate_with_stale_expected_current_is_rejected(client: TestClient):
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+
+    response = activate(client, 1, expected_current=1)  # actual current is 2
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "current_version_conflict"
+    assert body["current_version"] == 2
+    assert body["expected_current_version"] == 1
+
+    # State is untouched.
+    assert client.get("/api/v1/versions").json()["current_version"] == 2
+    assert client.get("/api/v1/trips/T1/stops").json()["version_id"] == 2
+
+
+def test_activate_with_null_expected_is_rejected_when_versions_exist(client: TestClient):
+    assert upload(client).status_code == 201
+    response = activate(client, 1, expected_current=None)
+    assert response.status_code == 409
+    assert response.json()["error"] == "current_version_conflict"
+    assert client.get("/api/v1/versions").json()["current_version"] == 1
+
+
+def test_activate_missing_artifact_keeps_state(client: TestClient):
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+    store = main_module.get_store()
+    info_v1, _ = store.get_version("1")
+    (store.artifacts_dir / info_v1.artifact_name).unlink()
+
+    response = activate(client, 1, expected_current=2)
+    assert response.status_code == 410
+    assert response.json()["error"] == "artifact_missing"
+    assert client.get("/api/v1/versions").json()["current_version"] == 2
+
+
+def test_activate_tampered_artifact_keeps_state(client: TestClient):
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+    store = main_module.get_store()
+    info_v1, _ = store.get_version("1")
+    artifact = store.artifacts_dir / info_v1.artifact_name
+    artifact.write_bytes(artifact.read_bytes() + b"tampered")
+
+    response = activate(client, 1, expected_current=2)
+    assert response.status_code == 409
+    assert response.json()["error"] == "artifact_digest_mismatch"
+    assert client.get("/api/v1/versions").json()["current_version"] == 2
+
+
+def test_activate_unknown_or_invalid_target(client: TestClient):
+    assert upload(client).status_code == 201
+
+    response = activate(client, 99, expected_current=1)
+    assert response.status_code == 404
+    assert response.json()["error"] == "version_not_found"
+
+    # 'current' is not a valid activation target; neither is junk.
+    for bad in ("current", "abc", "0", "-1"):
+        response = activate(client, bad, expected_current=1)
+        assert response.status_code == 400, bad
+        assert response.json()["error"] == "invalid_version"
+
+    assert client.get("/api/v1/versions").json()["current_version"] == 1
+
+
+def test_reactivating_current_version_is_a_noop_success(client: TestClient):
+    assert upload(client).status_code == 201
+    response = activate(client, 1, expected_current=1)
+    assert response.status_code == 200
+    assert response.json()["current_version"] == 1
+    assert response.json()["previous_version"] == 1
+
+
+def test_concurrent_activations_only_one_wins(client: TestClient):
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def worker(target):
+        barrier.wait()
+        results.append((target, activate(client, target, expected_current=3)))
+
+    threads = [
+        threading.Thread(target=worker, args=(1,)),
+        threading.Thread(target=worker, args=(2,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    statuses = sorted(response.status_code for _, response in results)
+    assert statuses == [200, 409], [(t, r.text) for t, r in results]
+    conflict = next(r for _, r in results if r.status_code == 409)
+    assert conflict.json()["error"] == "current_version_conflict"
+    # The single committed activation decided the current version.
+    winner = next(t for t, r in results if r.status_code == 200)
+    assert client.get("/api/v1/versions").json()["current_version"] == winner
+    assert client.get("/api/v1/trips/T1/stops").json()["version_id"] == winner
+
+
+def test_activation_serialized_across_store_instances(data_dir: Path):
+    """Two Store objects on one database behave like two service instances."""
+    first = Store(data_dir)
+    first.init()
+    main_module.set_store(first)
+    with TestClient(app) as c:
+        assert upload(c).status_code == 201
+        assert upload(c).status_code == 201
+    main_module._store = None
+
+    second = Store(data_dir)
+    second.init()
+
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def worker(store):
+        barrier.wait()
+        try:
+            store.activate(1, expected_current=2)
+            outcomes.append("activated")
+        except store_module.CurrentVersionConflict:
+            outcomes.append("conflict")
+
+    threads = [
+        threading.Thread(target=worker, args=(first,)),
+        threading.Thread(target=worker, args=(second,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["activated", "conflict"]
+    assert first.resolve_version("current") == 1
+    assert second.resolve_version("current") == 1
+
+
+def test_activation_survives_restart(data_dir: Path):
+    first = Store(data_dir)
+    first.init()
+    main_module.set_store(first)
+    with TestClient(app) as c:
+        assert upload(c).status_code == 201
+        assert upload(c).status_code == 201
+        assert activate(c, 1, expected_current=2).status_code == 200
+    main_module._store = None
+
+    restarted = Store(data_dir)
+    restarted.init()
+    main_module.set_store(restarted)
+    with TestClient(app) as c:
+        listing = c.get("/api/v1/versions").json()
+        assert listing["current_version"] == 1
+        assert c.get("/api/v1/trips/T1/stops").json()["version_id"] == 1
+    main_module._store = None
+
+
+def test_publish_after_manual_activation_still_auto_activates(client: TestClient):
+    assert upload(client).status_code == 201
+    assert upload(client).status_code == 201
+    assert activate(client, 1, expected_current=2).status_code == 200
+    assert client.get("/api/v1/versions").json()["current_version"] == 1
+
+    response = upload(client)
+    assert response.status_code == 201
+    body = response.json()
+    assert body["version"]["version_id"] == 3
+    assert body["previous_version"] == 1  # the genuinely current version
+    assert client.get("/api/v1/versions").json()["current_version"] == 3
+    assert client.get("/api/v1/trips/T1/stops").json()["version_id"] == 3
+
+
+def test_current_pointer_migrated_for_preexisting_db(data_dir: Path):
+    """Databases written before the meta table existed adopt MAX(version)."""
+    store = Store(data_dir)
+    store.init()
+    main_module.set_store(store)
+    with TestClient(app) as c:
+        assert upload(c).status_code == 201
+        assert upload(c).status_code == 201
+        assert activate(c, 1, expected_current=2).status_code == 200
+    main_module._store = None
+
+    # Simulate a pre-activation database: no meta row at all.
+    import sqlite3
+
+    conn = sqlite3.connect(data_dir / "gtfs.db")
+    conn.execute("DELETE FROM meta WHERE key = 'current_version_id'")
+    conn.commit()
+    conn.close()
+
+    migrated = Store(data_dir)
+    migrated.init()
+    main_module.set_store(migrated)
+    with TestClient(app) as c:
+        # Falls back to the old implicit rule: highest version is current.
+        assert c.get("/api/v1/versions").json()["current_version"] == 2
+    main_module._store = None
